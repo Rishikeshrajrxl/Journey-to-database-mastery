@@ -1,0 +1,44 @@
+name: Appian Deploy
+
+on: workflow_dispatch
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy package to Appian
+        env:
+          APPIAN_BASE_URL: ${{ secrets.APPIAN_BASE_URL }}
+          APPIAN_API_KEY: ${{ secrets.APPIAN_API_KEY }}
+        run: |
+          PACKAGE=./build/exported-package.zip
+          # Optional inspect
+          curl -s -X POST "$APPIAN_BASE_URL/suite/deployment-management/v2/inspections" \
+            -H "appian-api-key: $APPIAN_API_KEY" \
+            -F "packageFile=@${PACKAGE}" -o inspect.json || true
+          jq . inspect.json || true
+
+          # Import (deploy)
+          resp=$(curl -s -X POST "$APPIAN_BASE_URL/suite/deployment-management/v2/deployments" \
+            -H "appian-api-key: $APPIAN_API_KEY" -H "Action-Type: import" \
+            -F "name=CI Deploy - $GITHUB_SHA" -F "packageFile=@${PACKAGE}")
+          echo "resp=$resp"
+          uuid=$(echo "$resp" | jq -r '.deploymentId // .uuid // .id')
+          echo "UUID=$uuid"
+
+          # Poll for status
+          for i in {1..40}; do
+            status=$(curl -s "$APPIAN_BASE_URL/suite/deployment-management/v2/deployments/${uuid}" \
+              -H "appian-api-key: $APPIAN_API_KEY" | jq -r '.status // .state')
+            echo "Status: $status"
+            if [[ "$status" == "COMPLETED" || "$status" == "SUCCEEDED" ]]; then echo "Success"; exit 0; fi
+            if [[ "$status" == "FAILED" ]]; then
+              curl -s "$APPIAN_BASE_URL/suite/deployment-management/v2/deployments/${uuid}/log" \
+                -H "appian-api-key: $APPIAN_API_KEY" -o deployment-log.txt
+              cat deployment-log.txt; exit 1
+            fi
+            sleep 10
+          done
+          echo "Timed out waiting for deployment" && exit 1
